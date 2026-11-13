@@ -249,6 +249,7 @@ type Fs struct {
 	hasMESHA1          bool          // set if can use fastmail style checksums for SHA1
 	useStandardProps   bool          // set if should use standard props for PROPFIND
 	ntlmAuthMu         sync.Mutex    // mutex to serialize NTLM auth roundtrips
+	seenETags          sync.Map      // remote path -> ETag last read from the server (used by conflict_copies)
 	chunksUploadURL    string        // upload URL for nextcloud chunked
 	canChunk           bool          // set if nextcloud and nextcloud_chunk_size is set
 	canRecalcHash      bool          // set if the server can recalculate checksums with PATCH (nextcloud)
@@ -1076,6 +1077,7 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	o := f.createObject(src.Remote(), src.ModTime(ctx), src.Size())
+	o.etag = f.etagToReplace(ctx, src.Remote())
 	return o, o.Update(ctx, in, src, options...)
 }
 
@@ -1496,6 +1498,7 @@ func (o *Object) setMetaData(info *api.Prop) (err error) {
 	o.size = info.Size
 	o.modTime = time.Time(info.Modified)
 	o.etag = info.ETag
+	o.fs.rememberETag(o.remote, info.ETag)
 	if o.fs.hasOCMD5 || o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
 		hashes := info.Hashes()
 		if o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
@@ -1908,6 +1911,7 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
+	o.fs.seenETags.Delete(o.remote)
 	opts := rest.Opts{
 		Method:     "DELETE",
 		Path:       o.filePath(),
