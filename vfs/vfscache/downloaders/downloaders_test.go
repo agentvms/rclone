@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/ranges"
@@ -192,4 +193,26 @@ func TestDownloaders(t *testing.T) {
 		require.NoError(t, err, "a successful write must not fail due to unrelated stale state")
 		assert.Equal(t, len(p), n)
 	})
+}
+
+func TestTooManyErrors(t *testing.T) {
+	for _, test := range []struct {
+		retries, errors int
+		want            bool
+	}{
+		{10, 10, false}, // default: unchanged, more than maxErrorCount
+		{10, 11, true},
+		{1, 0, false},
+		{1, 1, true}, // --low-level-retries 1: the first error fails the waiting readers
+		{3, 2, false},
+		{3, 3, true},
+		{0, 5, false}, // 0 = not set: default behaviour
+		{50, 10, false},
+		{50, 11, true},
+	} {
+		ctx, ci := fs.AddConfig(context.Background())
+		ci.LowLevelRetries = test.retries
+		dls := &Downloaders{ctx: ctx, errorCount: test.errors}
+		assert.Equal(t, test.want, dls.tooManyErrors(), "retries=%d errors=%d", test.retries, test.errors)
+	}
 }

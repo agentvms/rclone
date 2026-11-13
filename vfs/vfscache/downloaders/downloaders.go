@@ -160,6 +160,29 @@ func (dls *Downloaders) _countErrors(n int64, err error) {
 	}
 }
 
+// errorLimit is how many consecutive download errors are tolerated before the
+// readers waiting for the file are failed. It is maxErrorCount, or
+// --low-level-retries when that is set lower, so that a user who wants quick
+// failures (a mount that must not hang while offline) can have them.
+func (dls *Downloaders) errorLimit() int {
+	if n := fs.GetConfig(dls.ctx).LowLevelRetries; n > 0 && n < maxErrorCount {
+		return n
+	}
+	return maxErrorCount
+}
+
+// tooManyErrors reports whether waiting readers should now be failed.
+// With the default (10 retries) this is the old "more than maxErrorCount";
+// with --low-level-retries N below that, N errors are enough.
+//
+// call with lock held
+func (dls *Downloaders) tooManyErrors() bool {
+	if limit := dls.errorLimit(); limit < maxErrorCount {
+		return dls.errorCount >= limit
+	}
+	return dls.errorCount > maxErrorCount
+}
+
 func (dls *Downloaders) countErrors(n int64, err error) {
 	dls.mu.Lock()
 	dls._countErrors(n, err)
@@ -437,8 +460,8 @@ func (dls *Downloaders) kickWaiters() (err error) {
 		return dls.lastErr
 	}
 
-	if dls.errorCount > maxErrorCount {
-		fs.Errorf(dls.src, "vfs cache: too many errors %d/%d: last error: %v", dls.errorCount, maxErrorCount, dls.lastErr)
+	if dls.tooManyErrors() {
+		fs.Errorf(dls.src, "vfs cache: too many errors %d/%d: last error: %v", dls.errorCount, dls.errorLimit(), dls.lastErr)
 		dls._closeWaiters(dls.lastErr)
 		return dls.lastErr
 	}
