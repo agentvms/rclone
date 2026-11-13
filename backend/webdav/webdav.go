@@ -1897,8 +1897,10 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 		// The server may still be dealing with it for a moment. A sleep isn't ideal but I
 		// haven't been able to think of a better method to find out if the server has
 		// finished - ncw
-		if isPreconditionFailed(err) {
-			// The server has a different version: it must not be removed
+		if o.fs.opt.ConflictCopies && !o.conflictCopy {
+			// The target may be a file the user or an agent has: whatever
+			// went wrong (412, 507, a 5xx, a dropped connection), a failed
+			// upload must not delete it
 			return err
 		}
 		time.Sleep(1 * time.Second)

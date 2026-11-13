@@ -31,6 +31,8 @@ type fakeDAV struct {
 	chunks map[string]string // upload dir -> content so far
 	seq    int
 	log    []string
+	// rejectPut, when not 0, makes every PUT of a file fail with this status without touching the file
+	rejectPut int
 }
 
 const davRoot = "/remote.php/dav/files/alice/"
@@ -53,6 +55,8 @@ func (d *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		d.chunks[dir] += string(b)
 		w.WriteHeader(http.StatusCreated)
+	case r.Method == "PUT" && d.rejectPut != 0:
+		w.WriteHeader(d.rejectPut)
 	case r.Method == "PUT":
 		cur, exists := d.files[name]
 		_ = cur
@@ -276,4 +280,30 @@ func TestConflictOffByDefault(t *testing.T) {
 	for _, l := range d.log {
 		assert.NotContains(t, l, "conflicted")
 	}
+}
+
+// A failed upload for any reason other than a 412 (507, a 5xx) must not delete
+// the file that is on the server: the server did not change it.
+func TestConflictFailedUploadKeepsServerFile(t *testing.T) {
+	for _, status := range []int{http.StatusInsufficientStorage, http.StatusInternalServerError, http.StatusBadGateway} {
+		d, f, ctx := newConflictFs(t, true, "10Mi")
+		d.set("doc.txt", "server version")
+		o, err := f.NewObject(ctx, "doc.txt")
+		require.NoError(t, err)
+		d.rejectPut = status
+		require.Error(t, update(ctx, o, "computer edit"), "status %d", status)
+		assert.Equal(t, "server version", d.files["doc.txt"], "status %d", status)
+		assert.Zero(t, d.deletes(), "status %d", status)
+	}
+}
+
+// With conflict copies off the base behaviour stays: a failed upload is cleaned up.
+func TestConflictOffFailedUploadStillRemoves(t *testing.T) {
+	d, f, ctx := newConflictFs(t, false, "10Mi")
+	d.set("doc.txt", "server version")
+	o, err := f.NewObject(ctx, "doc.txt")
+	require.NoError(t, err)
+	d.rejectPut = http.StatusInsufficientStorage
+	require.Error(t, update(ctx, o, "computer edit"))
+	assert.Equal(t, 1, d.deletes())
 }
