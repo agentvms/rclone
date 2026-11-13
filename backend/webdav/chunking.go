@@ -204,6 +204,15 @@ func (o *Object) mergeChunks(ctx context.Context, uploadDir string, options []fs
 		return fmt.Errorf("finalize chunked upload couldn't join URL: %w", err)
 	}
 	opts.ExtraHeaders = o.extraHeaders(ctx, src)
+	// On MOVE, If-Match/If-None-Match apply to the chunk source, not the
+	// destination, so check the destination's version just before merging.
+	delete(opts.ExtraHeaders, "If-Match")
+	delete(opts.ExtraHeaders, "If-None-Match")
+	if o.fs.opt.ConflictCopies && !o.conflictCopy {
+		if err := o.checkServerVersion(ctx); err != nil {
+			return err
+		}
+	}
 	opts.ExtraHeaders["Destination"] = destinationURL.String()
 	sleepTime := 5 * time.Second
 	wasLocked := false

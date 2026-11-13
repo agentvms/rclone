@@ -167,6 +167,16 @@ Set to 0 to disable chunked uploading.
 			Advanced: true,
 			Default:  false,
 		}, {
+			Name: "conflict_copies",
+			Help: `Never overwrite a file that changed on the server since rclone last saw it.
+
+Uploads send If-Match with the ETag rclone last saw (If-None-Match: * for
+new files). If the server has a newer version, the local version is
+uploaded as "name (conflicted copy YYYY-MM-DD HHMMSS).ext" instead and the
+server's version is kept.`,
+			Advanced: true,
+			Default:  false,
+		}, {
 			Name:     "owncloud_exclude_mounts",
 			Help:     "Exclude ownCloud mounted storages",
 			Advanced: true,
@@ -212,6 +222,7 @@ type Options struct {
 	ChunkSize          fs.SizeSuffix        `config:"nextcloud_chunk_size"`
 	ExcludeShares      bool                 `config:"owncloud_exclude_shares"`
 	ExcludeMounts      bool                 `config:"owncloud_exclude_mounts"`
+	ConflictCopies     bool                 `config:"conflict_copies"`
 	UnixSocket         string               `config:"unix_socket"`
 	AuthRedirect       bool                 `config:"auth_redirect"`
 }
@@ -250,13 +261,15 @@ type Fs struct {
 //
 // Will definitely have info but maybe not meta
 type Object struct {
-	fs          *Fs       // what this object is part of
-	remote      string    // The remote path
-	hasMetaData bool      // whether info below has been set
-	size        int64     // size of the object
-	modTime     time.Time // modification time of the object
-	sha1        string    // SHA-1 of the object content if known
-	md5         string    // MD5 of the object content if known
+	fs           *Fs       // what this object is part of
+	remote       string    // The remote path
+	hasMetaData  bool      // whether info below has been set
+	size         int64     // size of the object
+	modTime      time.Time // modification time of the object
+	sha1         string    // SHA-1 of the object content if known
+	md5          string    // MD5 of the object content if known
+	etag         string    // ETag of the object on the server when last read
+	conflictCopy bool      // this object is a conflict copy being written
 }
 
 // ------------------------------------------------------------
@@ -838,6 +851,7 @@ var owncloudProps = []byte(`<?xml version="1.0"?>
  <d:prop>
   <d:displayname />
   <d:getlastmodified />
+  <d:getetag />
   <d:getcontentlength />
   <d:resourcetype />
   <oc:checksums />
@@ -851,6 +865,7 @@ var standardProps = []byte(`<?xml version="1.0"?>
  <d:prop>
   <d:displayname/>
   <d:getlastmodified/>
+  <d:getetag/>
   <d:getcontentlength/>
   <d:resourcetype/>
  </d:prop>
@@ -1480,6 +1495,7 @@ func (o *Object) setMetaData(info *api.Prop) (err error) {
 	o.hasMetaData = true
 	o.size = info.Size
 	o.modTime = time.Time(info.Modified)
+	o.etag = info.ETag
 	if o.fs.hasOCMD5 || o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
 		hashes := info.Hashes()
 		if o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
@@ -1660,6 +1676,78 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	err = o.update(ctx, in, src, options...)
+	if err == nil || !o.fs.opt.ConflictCopies || !isPreconditionFailed(err) {
+		return err
+	}
+	return o.saveConflictCopy(ctx, src, options...)
+}
+
+// conflictPendingETag never matches a server ETag. It is set after a
+// conflict so that writes are guarded until the next listing.
+const conflictPendingETag = `"rclone-conflict-pending"`
+
+// checkServerVersion returns a 412 error if the file on the server is
+// not the version o was read from (or exists when o is new).
+func (o *Object) checkServerVersion(ctx context.Context) error {
+	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
+	exists := err == nil
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	changed := false
+	if o.etag != "" {
+		changed = !exists || info.ETag != o.etag
+	} else if !o.hasMetaData {
+		changed = exists
+	}
+	if changed {
+		return &api.Error{Status: "412 Precondition Failed (checked before merging chunks)", StatusCode: http.StatusPreconditionFailed}
+	}
+	return nil
+}
+
+// isPreconditionFailed reports whether err is an HTTP 412 from the server
+func isPreconditionFailed(err error) bool {
+	var apiErr *api.Error
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusPreconditionFailed
+}
+
+// saveConflictCopy uploads src next to o as a conflict copy, keeping the
+// server's version of o.
+//
+// o's metadata is set to describe src so that its fingerprint no longer
+// matches the server's version, which makes the VFS cache fetch the
+// server's version next time.
+func (o *Object) saveConflictCopy(ctx context.Context, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	srcObj, ok := src.(fs.Object)
+	if !ok {
+		return fmt.Errorf("conflict: %q changed on the server and the local version can't be re-read", o.remote)
+	}
+	ext := path.Ext(o.remote)
+	base := strings.TrimSuffix(o.remote, ext)
+	conflictRemote := fmt.Sprintf("%s (conflicted copy %s)%s", base, time.Now().Format("2006-01-02 150405"), ext)
+	rd, err := srcObj.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("conflict copy: reopen local version: %w", err)
+	}
+	defer func() { _ = rd.Close() }()
+	c := &Object{fs: o.fs, remote: conflictRemote, conflictCopy: true}
+	if err := c.update(ctx, rd, src, options...); err != nil {
+		return fmt.Errorf("conflict copy %q: %w", conflictRemote, err)
+	}
+	fs.Logf(o, "Changed on the server since it was read: kept the server's version, saved the local version as %q", conflictRemote)
+	o.hasMetaData = true
+	o.size = src.Size()
+	o.modTime = src.ModTime(ctx)
+	o.sha1, _ = src.Hash(ctx, hash.SHA1)
+	o.md5, _ = src.Hash(ctx, hash.MD5)
+	o.etag = conflictPendingETag
+	return nil
+}
+
+// update uploads in to o
+func (o *Object) update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	err = o.fs.mkParentDir(ctx, o.filePath())
 	if err != nil {
 		return fmt.Errorf("Update mkParentDir failed: %w", err)
@@ -1748,6 +1836,13 @@ func (o *Object) recalculateHash(ctx context.Context) error {
 
 func (o *Object) extraHeaders(ctx context.Context, src fs.ObjectInfo) map[string]string {
 	extraHeaders := map[string]string{}
+	if o.fs.opt.ConflictCopies && !o.conflictCopy {
+		if o.etag != "" {
+			extraHeaders["If-Match"] = o.etag
+		} else if !o.hasMetaData {
+			extraHeaders["If-None-Match"] = "*"
+		}
+	}
 	if o.fs.useOCMtime || o.fs.hasOCMD5 || o.fs.hasOCSHA1 {
 		if o.fs.useOCMtime {
 			extraHeaders["X-OC-Mtime"] = fmt.Sprintf("%d", src.ModTime(ctx).Unix())
@@ -1799,6 +1894,10 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 		// The server may still be dealing with it for a moment. A sleep isn't ideal but I
 		// haven't been able to think of a better method to find out if the server has
 		// finished - ncw
+		if isPreconditionFailed(err) {
+			// The server has a different version: it must not be removed
+			return err
+		}
 		time.Sleep(1 * time.Second)
 		// Remove failed upload
 		_ = o.Remove(ctx)

@@ -31,6 +31,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Time to cache directory entries for",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_stale_on_error",
+	Default: false,
+	Help:    "Keep serving the last directory listing if refreshing it fails (e.g. offline)",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_refresh",
 	Default: false,
 	Help:    "Refreshes the directory cache recursively in the background on start",
@@ -183,13 +188,14 @@ func init() {
 
 // Options is options for creating the vfs
 type Options struct {
-	NoSeek             bool          `config:"no_seek"`        // don't allow seeking if set
-	NoChecksum         bool          `config:"no_checksum"`    // don't check checksums if set
-	ReadOnly           bool          `config:"read_only"`      // if set VFS is read only
-	Links              bool          `config:"vfs_links"`      // if set interpret link files
-	NoModTime          bool          `config:"no_modtime"`     // don't read mod times for files
-	DirCacheTime       fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
-	Refresh            bool          `config:"vfs_refresh"`    // refreshes the directory listing recursively on start
+	NoSeek             bool          `config:"no_seek"`            // don't allow seeking if set
+	NoChecksum         bool          `config:"no_checksum"`        // don't check checksums if set
+	ReadOnly           bool          `config:"read_only"`          // if set VFS is read only
+	Links              bool          `config:"vfs_links"`          // if set interpret link files
+	NoModTime          bool          `config:"no_modtime"`         // don't read mod times for files
+	DirCacheTime       fs.Duration   `config:"dir_cache_time"`     // how long to consider directory listing cache valid
+	StaleOnError       bool          `config:"vfs_stale_on_error"` // keep the last listing if a refresh fails
+	Refresh            bool          `config:"vfs_refresh"`        // refreshes the directory listing recursively on start
 	PollInterval       fs.Duration   `config:"poll_interval"`
 	Umask              FileMode      `config:"umask"`
 	UID                uint32        `config:"uid"`

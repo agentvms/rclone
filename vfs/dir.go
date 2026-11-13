@@ -538,6 +538,12 @@ func (d *Dir) _readDir() error {
 		// We treat directory not found as empty because we
 		// create directories on the fly
 	} else if err != nil {
+		if d.vfs.Opt.StaleOnError && !d.read.IsZero() {
+			// Keep the entries we have and try again after the next dir cache time
+			fs.Logf(d.path, "Serving last listing: refresh failed: %v", err)
+			d.read = when
+			return nil
+		}
 		return err
 	}
 
