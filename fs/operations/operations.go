@@ -473,9 +473,13 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 		if dst != nil {
 			remote = transform.Path(ctx, dst.Remote(), false)
 			if !SameObject(src, dst) {
-				err = DeleteFile(ctx, dst)
-				if err != nil {
-					return newDst, err
+				// A backend that decides itself what happens to a file it replaces (webdav conflict
+				// copies: the file may have changed since dst was read) must not have it deleted first
+				if r, ok := fdst.(interface{ MoveReplaces() bool }); !ok || !r.MoveReplaces() {
+					err = DeleteFile(ctx, dst)
+					if err != nil {
+						return newDst, err
+					}
 				}
 			} else if src.Remote() == remote {
 				return newDst, nil

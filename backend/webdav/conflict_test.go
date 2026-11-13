@@ -3,10 +3,12 @@ package webdav_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -72,6 +75,12 @@ func (d *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.set(name, string(b))
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == "MKCOL":
+		w.WriteHeader(http.StatusCreated)
+	case r.Method == "MOVE" && strings.HasPrefix(r.URL.Path, davRoot):
+		// a plain file MOVE (rename); Overwrite: T replaces the destination
+		dest, _ := url.Parse(r.Header.Get("Destination"))
+		d.set(strings.TrimPrefix(dest.Path, davRoot), d.files[name])
+		delete(d.files, name)
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == "MOVE":
 		dir := strings.TrimPrefix(r.URL.Path, "/remote.php/dav/uploads/alice/")
@@ -306,4 +315,62 @@ func TestConflictOffFailedUploadStillRemoves(t *testing.T) {
 	d.rejectPut = http.StatusInsufficientStorage
 	require.Error(t, update(ctx, o, "computer edit"))
 	assert.Equal(t, 1, d.deletes())
+}
+
+// moveOver does what vfs/file.go does for a rename over an existing file:
+// look the destination up, then operations.Move.
+func moveOver(ctx context.Context, f fs.Fs, from, to string) error {
+	src, err := f.NewObject(ctx, from)
+	if err != nil {
+		return err
+	}
+	dst, err := f.NewObject(ctx, to)
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	_, err = operations.Move(ctx, f, dst, to, src)
+	return err
+}
+
+// A temporary file that was already uploaded, renamed over a file an agent changed
+// since the computer saw it: the agent's version stays, the computer's becomes a copy.
+func TestConflictUploadedTempRenameKeepsAgentVersion(t *testing.T) {
+	d, f, ctx := newConflictFs(t, true, "10Mi")
+	d.set("doc.txt", "old version")
+	_, err := f.NewObject(ctx, "doc.txt")
+	require.NoError(t, err)
+	require.NoError(t, upload(ctx, f, "temp.txt", "computer edit"))
+	d.set("doc.txt", "agent edit")
+	require.NoError(t, moveOver(ctx, f, "temp.txt", "doc.txt"))
+	assert.Equal(t, "agent edit", d.files["doc.txt"])
+	names := conflictNames(d, "doc")
+	require.Len(t, names, 1)
+	assert.Equal(t, "computer edit", d.files[names[0]])
+	_, still := d.files["temp.txt"]
+	assert.False(t, still)
+	assert.Zero(t, d.deletes())
+}
+
+// Nothing changed on the server since the computer saw doc.txt: the rename replaces it, no copy,
+// and a second save the same way is no conflict either.
+func TestConflictUploadedTempRenameReplacesUnchangedFile(t *testing.T) {
+	d, f, ctx := newConflictFs(t, true, "10Mi")
+	d.set("doc.txt", "old version")
+	_, err := f.NewObject(ctx, "doc.txt")
+	require.NoError(t, err)
+	for _, content := range []string{"edit one", "edit two"} {
+		require.NoError(t, upload(ctx, f, "temp.txt", content))
+		require.NoError(t, moveOver(ctx, f, "temp.txt", "doc.txt"))
+		assert.Equal(t, content, d.files["doc.txt"])
+	}
+	assert.Empty(t, conflictNames(d, "doc"))
+}
+
+// Renaming to a name that does not exist is a plain move.
+func TestConflictUploadedTempRenameToNewName(t *testing.T) {
+	d, f, ctx := newConflictFs(t, true, "10Mi")
+	require.NoError(t, upload(ctx, f, "temp.txt", "content"))
+	require.NoError(t, moveOver(ctx, f, "temp.txt", "new.txt"))
+	assert.Equal(t, "content", d.files["new.txt"])
+	assert.Empty(t, conflictNames(d, "new"))
 }

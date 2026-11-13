@@ -828,7 +828,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Pro
 	var err error
 	if info != nil {
 		// Set info
-		err = o.setMetaData(info)
+		err = o.setMetaData(info, true)
 	} else {
 		err = o.readMetaData(ctx) // reads info and meta, returning an error
 	}
@@ -1337,6 +1337,9 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if f.opt.ConflictCopies {
+		return f.moveKeepingChanges(ctx, src, remote)
+	}
 	return f.copyOrMove(ctx, src, remote, "MOVE")
 }
 
@@ -1493,12 +1496,16 @@ func (o *Object) Size() int64 {
 }
 
 // setMetaData sets the metadata from info
-func (o *Object) setMetaData(info *api.Prop) (err error) {
+func (o *Object) setMetaData(info *api.Prop, listed bool) (err error) {
 	o.hasMetaData = true
 	o.size = info.Size
 	o.modTime = time.Time(info.Modified)
 	o.etag = info.ETag
-	o.fs.rememberETag(o.remote, info.ETag)
+	if listed {
+		o.fs.rememberETag(o.remote, info.ETag)
+	} else {
+		o.fs.rememberETagIfUnseen(o.remote, info.ETag)
+	}
 	if o.fs.hasOCMD5 || o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
 		hashes := info.Hashes()
 		if o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
@@ -1522,7 +1529,7 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	return o.setMetaData(info)
+	return o.setMetaData(info, false)
 }
 
 // ModTime returns the modification time of the object
@@ -1790,6 +1797,9 @@ func (o *Object) update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	err = o.readMetaData(ctx)
 	if err != nil {
 		return err
+	}
+	if !o.conflictCopy {
+		o.fs.rememberETag(o.remote, o.etag) // our own upload is the version we know now
 	}
 	// The server only stores a checksum supplied with the upload,
 	// so ask the server to calculate one if it is missing.
