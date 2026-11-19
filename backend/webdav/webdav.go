@@ -251,6 +251,7 @@ type Fs struct {
 	useStandardProps   bool          // set if should use standard props for PROPFIND
 	ntlmAuthMu         sync.Mutex    // mutex to serialize NTLM auth roundtrips
 	seenETags          sync.Map      // remote path -> ETag last read from the server (used by conflict_copies)
+	noBaseETags        sync.Map      // remote path -> held while a restarted mount uploads an edit whose base is unknown (conflict_copies)
 	chunksUploadURL    string        // upload URL for nextcloud chunked
 	canChunk           bool          // set if nextcloud and nextcloud_chunk_size is set
 	canRecalcHash      bool          // set if the server can recalculate checksums with PATCH (nextcloud)
@@ -1772,6 +1773,7 @@ func (o *Object) saveConflictCopy(ctx context.Context, src fs.ObjectInfo, option
 	o.sha1, _ = src.Hash(ctx, hash.SHA1)
 	o.md5, _ = src.Hash(ctx, hash.MD5)
 	o.etag = conflictPendingETag
+	o.fs.endNoBase(o.remote)
 	return nil
 }
 
@@ -1818,6 +1820,7 @@ func (o *Object) update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	if !o.conflictCopy {
+		o.fs.endNoBase(o.remote)
 		o.fs.rememberETag(o.remote, o.etag) // our own upload is the version we know now
 	}
 	// The server only stores a checksum supplied with the upload,
@@ -1943,6 +1946,7 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	o.fs.seenETags.Delete(o.remote)
+	o.fs.endNoBase(o.remote)
 	opts := rest.Opts{
 		Method:     "DELETE",
 		Path:       o.filePath(),

@@ -102,6 +102,18 @@ func (d *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(d.files, name)
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == "PROPFIND" && name == "":
+		// a directory listing (Depth: 1) of the root: the folder itself, then every file
+		w.WriteHeader(http.StatusMultiStatus)
+		fmt.Fprintf(w, `<d:multistatus xmlns:d="DAV:"><d:response><d:href>%s</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`, davRoot)
+		for n, c := range d.files {
+			if strings.Contains(n, "/") {
+				continue
+			}
+			fmt.Fprintf(w, `<d:response><d:href>%s%s</d:href><d:propstat><d:prop><d:getcontentlength>%d</d:getcontentlength><d:getetag>&quot;%s&quot;</d:getetag><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`,
+				davRoot, n, len(c), strings.Trim(d.etags[n], "\""))
+		}
+		fmt.Fprint(w, `</d:multistatus>`)
 	case r.Method == "PROPFIND":
 		content, ok := d.files[name]
 		if !ok {

@@ -14,6 +14,9 @@ import (
 // rememberETag records the ETag the server reported for remote.
 func (f *Fs) rememberETag(remote, etag string) {
 	if f.opt.ConflictCopies && etag != "" {
+		if _, held := f.noBaseETags.Load(remote); held {
+			return // a listing must not make the server's new version the one the edit is based on
+		}
 		f.seenETags.Store(remote, etag)
 	}
 }
@@ -23,6 +26,9 @@ func (f *Fs) rememberETag(remote, etag string) {
 // replaced by a version that appeared on the server since.
 func (f *Fs) rememberETagIfUnseen(remote, etag string) {
 	if f.opt.ConflictCopies && etag != "" {
+		if _, held := f.noBaseETags.Load(remote); held {
+			return
+		}
 		f.seenETags.LoadOrStore(remote, etag)
 	}
 }
@@ -31,7 +37,18 @@ func (f *Fs) rememberETagIfUnseen(remote, etag string) {
 // replacement of the version last read. The VFS calls it for a file it knows changed on the
 // server after the local copy was made (the mount restarted with an unsaved edit): reading the
 // object to compare it must not turn the server's new version into the one the edit is based on.
-func (f *Fs) ForgetSeenETag(remote string) { f.seenETags.Delete(remote) }
+//
+// The forgetting holds until the write of remote has ended (the upload or its conflict copy): a
+// directory listing that runs between the restart and the upload (the refresher's first full
+// refresh) must not store the server's new ETag again, or the upload goes out with If-Match on the
+// machine's version and replaces it (vml-zrx9).
+func (f *Fs) ForgetSeenETag(remote string) {
+	f.seenETags.Delete(remote)
+	f.noBaseETags.Store(remote, struct{}{})
+}
+
+// endNoBase lets listings record remote's ETag again (its write ended).
+func (f *Fs) endNoBase(remote string) { f.noBaseETags.Delete(remote) }
 
 // MoveReplaces tells operations.Move not to delete the destination before a
 // move: Move decides what happens to a file that is replaced.
