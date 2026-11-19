@@ -817,8 +817,16 @@ func (d *Dir) readDirTree() error {
 func (d *Dir) readDir() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// A forced re-read marks the listing stale first. When the re-read then fails (the remote is unreachable), the
+	// stale mark must not stay: every lookup in this directory would try to list again and fail with an I/O error,
+	// although the last good listing is still there. Keep the old read time on failure.
+	read := d.read
 	d.read = time.Time{}
-	return d._readDir()
+	err := d._readDir()
+	if err != nil {
+		d.read = read
+	}
+	return err
 }
 
 // jsonErrorf formats the string according to a format specifier and

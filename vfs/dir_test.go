@@ -902,3 +902,37 @@ func TestDirRenameParentEntries(t *testing.T) {
 
 	assert.Equal(t, before, slices.Sorted(maps.Keys(root.items)))
 }
+
+// listFailFs is an Fs whose listings fail while fail is set (the remote is unreachable).
+type listFailFs struct {
+	fs.Fs
+	fail bool
+}
+
+func (f *listFailFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if f.fail {
+		return nil, errors.New("couldn't list files: i/o timeout")
+	}
+	return f.Fs.List(ctx, dir)
+}
+
+// A forced re-read of a directory (vfs/refresh without recursive) that fails because the remote is unreachable keeps serving the
+// last good listing: before, it left the directory marked stale and every lookup in it failed with an I/O error.
+func TestDirForcedReReadFailureKeepsListing(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+	_, err := dir.ReadDirAll() // the directory's own listing has been read once
+	require.NoError(t, err)
+	ff := &listFailFs{Fs: dir.f}
+	dir.f = ff
+
+	ff.fail = true
+	require.Error(t, dir.readDir())
+	node, err := dir.Stat("file1")
+	require.NoError(t, err, "the last good listing is still used after a failed forced re-read")
+	assert.Equal(t, "file1", node.Name())
+
+	ff.fail = false
+	require.NoError(t, dir.readDir())
+	_, err = dir.Stat("file1")
+	require.NoError(t, err)
+}
