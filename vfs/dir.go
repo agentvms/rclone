@@ -2,17 +2,21 @@ package vfs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/object"
@@ -533,7 +537,7 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
-	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+	entries, err := d.listRetrying()
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we
 		// create directories on the fly
@@ -811,6 +815,31 @@ func (d *Dir) readDirTree() error {
 	d.read = when
 	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	return nil
+}
+
+// listRetries is how many more times a listing is tried after a transient failure (a connection reset, a dropped connection, a slow
+// answer). The backends' own low level retries are switched down to 1 for the mount (an offline open must fail fast), which also
+// left a listing with no retry at all: one reset on one folder's request reached the program as an I/O error.
+const listRetries = 2
+
+// listRetrying lists the directory, trying again after a transient failure. A failure to connect is not retried (the remote is not
+// there: the caller learns it after one connect timeout), nor is anything that is not a transient network error.
+func (d *Dir) listRetrying() (entries fs.DirEntries, err error) {
+	for try := 0; ; try++ {
+		entries, err = list.DirSorted(d.vfs.ctx, d.f, false, d.path)
+		if err == nil || try >= listRetries || d.vfs.ctx.Err() != nil || !fserrors.ShouldRetry(err) || isDialError(err) {
+			return entries, err
+		}
+		fs.Infof(d.path, "Listing failed, trying again (%d/%d): %v", try+1, listRetries, err)
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// isDialError reports whether err is a failure to connect: the remote is not there (a connect timeout, no route, refused). A reset
+// while connecting is not one: something answered and the connection was lost, as a reset on an open connection is, so it is retried.
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial" && !errors.Is(err, syscall.ECONNRESET)
 }
 
 // readDir forces a refresh of the directory

@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
+	"net/url"
 	"os"
 	"runtime"
 	"slices"
 	"sort"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -935,4 +938,56 @@ func TestDirForcedReReadFailureKeepsListing(t *testing.T) {
 	require.NoError(t, dir.readDir())
 	_, err = dir.Stat("file1")
 	require.NoError(t, err)
+}
+
+// listErrFs fails its listings with err for the first failures calls.
+type listErrFs struct {
+	fs.Fs
+	err      error
+	failures int
+	calls    int
+}
+
+func (f *listErrFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, f.err
+	}
+	return f.Fs.List(ctx, dir)
+}
+
+// A listing that hits a connection reset is tried again, so the program does not see an I/O error for one lost connection; a failure
+// to connect is not retried (offline fails after one connect timeout); a reset that keeps happening is reported after the retries.
+func TestDirListRetriesTransientErrors(t *testing.T) {
+	reset := fmt.Errorf("couldn't list files: %w", &url.Error{Op: "Propfind", URL: "http://x/dir/", Err: &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}})
+	dial := fmt.Errorf("couldn't list files: %w", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded})
+	// seen in the local proof (vml-5i0u set6): "dial tcp ...: connect: connection reset by peer", a reset answered to the connect
+	dialReset := fmt.Errorf("couldn't list files: %w", &url.Error{Op: "Propfind", URL: "http://x/dir/", Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNRESET)}})
+	for _, tc := range []struct {
+		name      string
+		err       error
+		failures  int
+		wantErr   bool
+		wantCalls int
+	}{
+		{"one reset is retried", reset, 1, false, 2},
+		{"two resets are retried", reset, 2, false, 3},
+		{"resets that keep happening are reported", reset, 99, true, 3},
+		{"a failure to connect is not retried", dial, 99, true, 1},
+		{"a reset while connecting is retried", dialReset, 1, false, 2},
+		{"a reset while connecting that keeps happening is reported", dialReset, 99, true, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, dir, _ := dirCreate(t)
+			ef := &listErrFs{Fs: dir.f, err: tc.err, failures: tc.failures}
+			dir.f = ef
+			_, err := dir.ReadDirAll()
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantCalls, ef.calls)
+		})
+	}
 }
