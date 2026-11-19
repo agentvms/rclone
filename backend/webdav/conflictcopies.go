@@ -27,6 +27,12 @@ func (f *Fs) rememberETagIfUnseen(remote, etag string) {
 	}
 }
 
+// ForgetSeenETag makes the next write of remote a creation (If-None-Match: *) instead of a
+// replacement of the version last read. The VFS calls it for a file it knows changed on the
+// server after the local copy was made (the mount restarted with an unsaved edit): reading the
+// object to compare it must not turn the server's new version into the one the edit is based on.
+func (f *Fs) ForgetSeenETag(remote string) { f.seenETags.Delete(remote) }
+
 // MoveReplaces tells operations.Move not to delete the destination before a
 // move: Move decides what happens to a file that is replaced.
 func (f *Fs) MoveReplaces() bool { return f.opt.ConflictCopies }

@@ -869,3 +869,28 @@ func TestItemHandleCachingStaleReopenReadsRemote(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, contents, string(buf[:n]))
 }
+
+// TestItemReloadBase checks which remote object a reloaded dirty item may be written over: only the one the cached
+// copy was made from (same fingerprint), never one that changed while the cache was down or that the cache never saw.
+func TestItemReloadBase(t *testing.T) {
+	r, c := newItemTestCache(t)
+	_, obj, item := newFile(t, r, c, "based")
+	require.NoError(t, item.Open(obj))
+	_, err := item.WriteAt([]byte("computer edit"), 0)
+	require.NoError(t, err)
+	require.True(t, item.IsDirty())
+
+	item.mu.Lock()
+	assert.NotEmpty(t, item.info.Fingerprint)
+	assert.Nil(t, item._reloadBase(nil), "no remote object")
+	assert.Equal(t, obj, item._reloadBase(obj), "the remote object the copy was made from")
+	// the machine changed the file while the mount was down
+	r.WriteObject(context.Background(), "based", "machine edit, a different size", time.Now().Add(time.Hour))
+	changed, err := r.Fremote.NewObject(context.Background(), "based")
+	require.NoError(t, err)
+	assert.Nil(t, item._reloadBase(changed), "the remote object changed")
+	// a file created here that the cache never saw on the remote
+	item.info.Fingerprint = ""
+	assert.Nil(t, item._reloadBase(changed), "never seen on the remote")
+	item.mu.Unlock()
+}

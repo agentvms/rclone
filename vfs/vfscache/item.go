@@ -866,6 +866,12 @@ func (item *Item) reload(ctx context.Context) error {
 	}
 	// see if the object still exists
 	obj, _ := item.c.fremote.NewObject(ctx, item.name)
+	// a remote object that changed while the cache was down is not the one this
+	// edit was based on: upload as a new object, so a backend that checks
+	// (webdav --webdav-conflict-copies) keeps the remote version
+	item.mu.Lock()
+	obj = item._reloadBase(obj)
+	item.mu.Unlock()
 	// open the file with the object (or nil)
 	err := item.Open(obj)
 	if err != nil {
@@ -940,6 +946,29 @@ func (item *Item) _checkObject(o fs.Object) error {
 	}
 
 	return nil
+}
+
+// _reloadBase returns the remote object a reloaded dirty item may be written over,
+// or nil when the remote object is not the one the cached copy was made from: its
+// fingerprint differs from the one the cache recorded when it last saw the remote
+// object, or the cache never saw one (the file was created here while the remote
+// had none, and the remote has one now). The upload then goes out as the creation
+// of a new object.
+//
+// call with lock held
+func (item *Item) _reloadBase(obj fs.Object) fs.Object {
+	if obj == nil {
+		return nil
+	}
+	remoteFingerprint := fs.Fingerprint(item.c.ctx, obj, item.c.opt.FastFingerprint)
+	if item.info.Fingerprint != remoteFingerprint {
+		fs.Logf(item.name, "vfs cache: the remote file changed while the mount was not running (remote fingerprint %q, cached %q): saving the local version as a new file", remoteFingerprint, item.info.Fingerprint)
+		if ff, ok := item.c.fremote.(interface{ ForgetSeenETag(remote string) }); ok {
+			ff.ForgetSeenETag(item.name) // reading the object just now must not make its ETag the one the edit is based on
+		}
+		return nil
+	}
+	return obj
 }
 
 // WrittenBack checks to see if the item has been written back or not
