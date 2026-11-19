@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -323,6 +324,24 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 		return true, err
 	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+// shouldRetryOpen is shouldRetry for reading a file. With conflict copies on, a failure to
+// connect is not retried: the connection could not be made at all (the network is down or the
+// machine is off), a retry only repeats the wait and, through the pacer's back-off, queues every
+// later open behind it, so an offline open took 5 s and more. Listings keep their retry: one lost
+// packet must not fail a whole folder.
+func (f *Fs) shouldRetryOpen(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if f.opt.ConflictCopies && isDialError(err) {
+		return false, err
+	}
+	return f.shouldRetry(ctx, resp, err)
+}
+
+// isDialError reports whether err is a failure to connect (net.OpError with Op "dial")
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // safeRoundTripper is a wrapper for http.RoundTripper that serializes
@@ -1672,7 +1691,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 				return true, fserrors.RetryError(err)
 			}
 		}
-		return o.fs.shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetryOpen(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
